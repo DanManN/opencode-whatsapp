@@ -1,0 +1,23 @@
+{
+  "name": "opencode-whatsapp-agent",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "opencode plugin: chat with a session from a WhatsApp agent chat, approve permissions with reactions, answer questions",
+  "keywords": ["opencode", "opencode-plugin", "whatsapp"],
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "main": "./src/index.ts",
+  "files": ["src"],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "bun test"
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "1.19.5",
+    "@opencode/plugin": "2.2.6",
+    "@types/bun": "1.4.4",
+    "typescript": "7.0.2"
+  }
+}
