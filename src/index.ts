@@ -10,11 +10,15 @@
  * Or copy this file to ~/.config/opencode/plugins/whatsapp-agent.ts.
  * Then put the API key in ~/.config/opencode/whatsapp-agent.key (mode 600) or WHATSAPP_AGENT_API_KEY.
  *
+ * V2 works across projects: one bridge per process, and every project the server loads registers with it.
+ * Set "experimental": { "location_idle_timeout": false } so idle projects (and the bridge) aren't unloaded.
+ * V1 stays in the project it loaded in.
+ *
  * Environment:
  *   WHATSAPP_AGENT_API_KEY       API key from the agent's Chat info > API key
  *   WHATSAPP_AGENT_API_KEY_FILE  Key file path (default ~/.config/opencode/whatsapp-agent.key)
- *   WHATSAPP_AGENT_FORWARD       "whatsapp" (default): forward permission prompts only for sessions
- *                                driven from WhatsApp and their subagents. "all": every session here.
+ *   WHATSAPP_AGENT_FORWARD       "whatsapp" (default): WhatsApp sees one session at a time, the current one and
+ *                                its subagents. "all": approvals and questions from every session.
  *   WHATSAPP_AGENT_AGENT         Optional opencode agent for WhatsApp sessions (e.g. "build")
  *   WHATSAPP_AGENT_MODEL         Optional "providerID/modelID" for WhatsApp sessions
  *   WHATSAPP_AGENT_STATE_DIR     State dir (default ~/.local/state/opencode-whatsapp-agent)
@@ -29,13 +33,21 @@ import type { Plugin as PluginV1 } from "@opencode-ai/plugin"
 import type { Plugin as PluginV2 } from "@opencode/plugin"
 import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs"
 import { homedir } from "node:os"
-import { join } from "node:path"
+import { isAbsolute, join, resolve } from "node:path"
 
 const DEFAULT_BASE_URL = "https://api.whatsapp.com/agent/v1"
 const MAX_TEXT = 4096 // platform cap per text message
 const CHUNK = 3900 // leave room for the "(i/n)" suffix
 const MAX_CHUNKS = 5 // 12 sends/min: keep one reply under ~30s
 const GLOBAL_KEY = Symbol.for("opencode.whatsapp-agent.bridge")
+const REGISTRY_KEY = Symbol.for("opencode.whatsapp-agent.v2-registry")
+
+/**
+ * V2 plugins can't answer forms yet (anomalyco/opencode#59655 adds ctx.session.form). Until then WhatsApp
+ * sessions get a rule denying the question tool, so the model asks in plain text. Set to false once that
+ * lands: the deny rule goes away and question forms are forwarded through ctx.session.form instead.
+ */
+const QUESTION_GUARD = true
 
 type ContextV2 = PluginV2.Context
 type Reply = "once" | "always" | "reject"
@@ -49,8 +61,9 @@ type Options = {
   sendIntervalMs?: number // 12 sends/min and 12 statuses/min per agent
   pollFloorMs?: number // 15 polls/min per agent
   pollTimeoutSec?: number // 0-25
+  questionGuard?: boolean // tests only; defaults to QUESTION_GUARD
 }
-type BridgeOpts = Required<Pick<Options, "forward" | "sendIntervalMs" | "pollFloorMs" | "pollTimeoutSec">>
+type BridgeOpts = Required<Pick<Options, "forward" | "sendIntervalMs" | "pollFloorMs" | "pollTimeoutSec" | "questionGuard">>
 
 /** Permission request, normalized across V1 (permission/patterns/always) and V2 (action/resources/save). */
 type PermissionRequest = {
@@ -60,50 +73,52 @@ type PermissionRequest = {
   patterns?: string[]
   always?: string[]
   metadata?: Record<string, unknown>
+  directory?: string // V2: the project that raised it (replies go through that project's plugin context)
 }
 
-/** One question from opencode's question tool (same shape in V1 and V2). */
+/** One question, from V1's question tool or a V2 question form. */
 type Question = {
   question: string
   header?: string
   options?: { label: string; description?: string }[]
   multiple?: boolean
-  custom?: boolean // V1 only; V2 always allows a typed answer
+  custom?: boolean
 }
 
-/** A question request plus how to answer it: V1 posts to the server, V2 resolves the wrapped tool call. */
+/** A question request plus how to answer it: V1 posts to the server, V2 replies to the form. */
 type QuestionRequest = {
   id: string
   sessionID: string
   questions: Question[]
   answer(answers: string[][]): Promise<boolean>
   dismiss(): Promise<boolean>
-  /** Called when the bridge stops with the question unanswered (V2: fail the waiting tool call). */
-  abandon?(): void
 }
 
 type QuestionState = { req: QuestionRequest; index: number; answers: string[][]; wamid?: string }
 
-type SessionRef = { id: string; title?: string; parentID?: string; updated: number }
+type SessionRef = { id: string; title?: string; parentID?: string; updated: number; directory?: string }
 type ModelRef = { providerID: string; modelID: string; name?: string }
 
 const modelKey = (m: ModelRef) => `${m.providerID}/${m.modelID}`
 
 /** The opencode operations the bridge needs; one adapter per plugin API version. */
 interface Host {
+  /** V2: sessions in any project. V1: only the project the plugin loaded in. */
+  readonly multiProject: boolean
   log(level: Level, message: string, extra?: object): void
   getSession(id: string): Promise<SessionRef | undefined>
-  createSession(title: string): Promise<SessionRef | undefined>
+  /** `directory` is where to create it (V2); V1 always uses its own project. */
+  createSession(title: string, directory?: string): Promise<SessionRef | undefined>
   listSessions(): Promise<SessionRef[]>
   /**
    * Starts a turn without waiting for it. `model` is the model picked with /model (V1 sends it per prompt;
    * V2 ignores it because /model already switched the session). Resolves to an error description, or undefined.
    */
   prompt(sessionID: string, text: string, model?: ModelRef): Promise<string | undefined>
-  /** Chat models from configured providers. */
-  listModels(): Promise<ModelRef[]>
+  /** Chat models from configured providers (V2: as configured for `directory`). */
+  listModels(directory?: string): Promise<ModelRef[]>
   /** The model new sessions get when nothing else is chosen. */
-  defaultModel(): Promise<ModelRef | undefined>
+  defaultModel(directory?: string): Promise<ModelRef | undefined>
   /** The model the session currently uses, when the host can tell. */
   sessionModel(sessionID: string): Promise<ModelRef | undefined>
   /** Switches the session's model. Resolves to an error description, or undefined. */
@@ -112,14 +127,22 @@ interface Host {
   /** Text of the last assistant message created at or after `since`. */
   finalReply(sessionID: string, since: number): Promise<{ text: string; error?: string }>
   /** Resolves to false when the request no longer exists. */
-  reply(sessionID: string, requestID: string, reply: Reply): Promise<boolean>
+  reply(req: PermissionRequest, reply: Reply): Promise<boolean>
+  /** V2: adds a session rule denying the question tool. Resolves to an error description, or undefined. */
+  denyQuestions?(sessionID: string): Promise<string | undefined>
+  /** V2: removes that rule again (the last matching one). Resolves to an error description, or undefined. */
+  allowQuestions?(sessionID: string): Promise<string | undefined>
 }
+
+// Session rules are evaluated last and the last match wins, so this overrides agent/config rules.
+const DENY_QUESTION = { action: "question", resource: "*", effect: "deny" } as const
+const isDenyQuestion = (r: any) => r?.action === "question" && r.resource === "*" && r.effect === "deny"
 
 type State = {
   offset?: number
   creator?: string // "user:<id>", learned from a verified inbound message
-  sessions: Record<string, string> // directory -> current WhatsApp session id
-  driven: string[] // session ids prompted from WhatsApp (bounded)
+  sessions: Record<string, string> // V1: directory -> current session id; V2: "*" -> current session id
+  cwd?: string // V2: where /new and first messages create sessions (set with /cd)
   models: Record<string, ModelRef> // session id -> model picked with /model (bounded)
 }
 
@@ -239,10 +262,32 @@ function parseAnswer(q: Question, text: string): string[] | string {
   return [text]
 }
 
-const answersText = (questions: Question[], answers: string[][]) =>
-  `User has answered your questions: ${questions
-    .map((q, i) => `"${q.question}"="${answers[i]?.length ? answers[i].join(", ") : "Unanswered"}"`)
-    .join(", ")}. You can now continue with the user's answers in mind.`
+/** V2 form -> questions, when every visible field is a string or multiselect (the question tool's shape). */
+function formQuestions(form: any): { questions: Question[]; fields: any[] } | undefined {
+  const fields: any[] = (form?.fields ?? []).filter((f: any) => !f?.hidden)
+  if (!fields.length || !fields.every((f) => f?.key && (f.type === "string" || f.type === "multiselect"))) return undefined
+  const questions = fields.map((f) => ({
+    header: f.title,
+    question: f.description || f.title || form.title || "Question",
+    options: (f.options ?? []).map((o: any) => ({ label: String(o.label ?? o.value), description: o.description })),
+    multiple: f.type === "multiselect",
+    custom: f.type === "multiselect" ? f.custom === true : f.custom !== false || !f.options?.length,
+  }))
+  return { questions, fields }
+}
+
+/** Answers (option labels or typed text) -> a form answer keyed by field key, using option values. */
+function formAnswer(fields: any[], answers: string[][]) {
+  const out: Record<string, string | string[]> = {}
+  fields.forEach((f, i) => {
+    const values = (answers[i] ?? []).map((a) => f.options?.find((o: any) => o.label === a)?.value ?? a)
+    if (f.type === "multiselect") out[f.key] = values
+    else if (values.length) out[f.key] = values[0]
+  })
+  return out
+}
+
+const tilde = (dir: string) => (dir.startsWith(homedir() + "/") ? "~" + dir.slice(homedir().length) : dir)
 
 function ago(ms: number) {
   const s = Math.max(0, Math.round((Date.now() - ms) / 1000))
@@ -316,8 +361,11 @@ function acquireLock(path: string): boolean {
 /** V1 (opencode 1.18.29+): the SDK client handed to `server(input)`. */
 function hostV1(client: any): Host {
   const ref = (s: any): SessionRef | undefined =>
-    s?.id ? { id: s.id, title: s.title, parentID: s.parentID, updated: s.time?.updated ?? 0 } : undefined
+    s?.id
+      ? { id: s.id, title: s.title, parentID: s.parentID, updated: s.time?.updated ?? 0, directory: s.directory }
+      : undefined
   return {
+    multiProject: false,
     log(level, message, extra) {
       // Never log message text or the API key.
       void client.app?.log?.({ body: { service: "whatsapp-agent", level, message, extra } })?.catch?.(() => {})
@@ -378,9 +426,9 @@ function hostV1(client: any): Host {
       const err = last?.info?.error
       return { text, error: err ? `${err.name ?? "error"}: ${clip(String(err.data?.message ?? ""), 500)}` : undefined }
     },
-    async reply(sessionID, requestID, reply) {
+    async reply(req, reply) {
       const res = await client.postSessionIdPermissionsPermissionId({
-        path: { id: sessionID, permissionID: requestID },
+        path: { id: req.sessionID, permissionID: req.id },
         body: { response: reply },
       })
       return !res?.error
@@ -388,12 +436,149 @@ function hostV1(client: any): Host {
   }
 }
 
-/** V2 (opencode 2.x): the plugin context handed to `setup(ctx)`. Its methods throw on errors. */
-function hostV2(ctx: ContextV2): Host {
-  const c = ctx as any
+/**
+ * V2 (opencode 2.x): opencode runs one plugin instance per project ("location"). Every instance registers its
+ * context here; the process has one bridge. Session calls use any live context (the session service is
+ * global), while permission and form replies go through the context of the project that raised them.
+ */
+class V2Registry {
+  readonly contexts = new Map<string, ContextV2>()
+  bridge?: Bridge
+  private listener?: { directory: string; controller: AbortController }
+
+  add(ctx: ContextV2) {
+    this.contexts.set(ctx.location.directory, ctx)
+    if (this.bridge && !this.bridge.stopped && !this.listener) this.listen()
+  }
+
+  /** Called on dispose (also when idle projects are unloaded). The bridge stops with the last project. */
+  remove(ctx: ContextV2) {
+    const directory = ctx.location.directory
+    if (this.contexts.get(directory) === ctx) this.contexts.delete(directory)
+    if (this.listener?.directory === directory) {
+      this.listener.controller.abort()
+      this.listener = undefined
+    }
+    if (!this.contexts.size) {
+      if (this.bridge) stopBridge(this.bridge)
+      this.bridge = undefined
+    } else if (this.bridge && !this.bridge.stopped && !this.listener) this.listen()
+  }
+
+  any(): any {
+    const ctx = this.contexts.values().next().value
+    if (!ctx) throw new Error("no opencode project is loaded")
+    return ctx
+  }
+
+  at(directory: string | undefined): any {
+    return (directory && this.contexts.get(directory)) || this.any()
+  }
+
+  /** One subscription is enough: the event bus is server-wide. */
+  listen() {
+    const bridge = this.bridge
+    if (!bridge || !this.contexts.size) return
+    const ctx = this.any() as ContextV2
+    this.listener?.controller.abort()
+    const controller = new AbortController()
+    this.listener = { directory: ctx.location.directory, controller }
+    const types = bridge.opts.questionGuard ? V2_EVENTS : [...V2_EVENTS, ...V2_FORM_EVENTS]
+    void (async () => {
+      try {
+        const stream = (ctx.event as any).subscribe({ types, signal: controller.signal })
+        for await (const event of stream as AsyncIterable<any>) {
+          if (controller.signal.aborted) break
+          try {
+            await this.onEvent(bridge, event)
+          } catch (err) {
+            bridge.log("error", `event ${event?.type} failed`, { error: String(err) })
+          }
+        }
+      } catch (err) {
+        if (!controller.signal.aborted) bridge.log("error", "event stream ended", { error: String(err) })
+      }
+    })()
+  }
+
+  private async onEvent(bridge: Bridge, event: any) {
+    const d = event?.data ?? {}
+    const directory: string | undefined = event?.location?.directory
+    switch (event?.type) {
+      case "permission.asked":
+        return bridge.onPermissionAsked({
+          id: d.id,
+          sessionID: d.sessionID,
+          permission: d.action,
+          patterns: d.resources,
+          always: d.save,
+          metadata: d.metadata,
+          directory,
+        })
+      case "permission.replied":
+        return bridge.onPermissionReplied(d.requestID)
+      case "session.execution.succeeded":
+        return bridge.onIdle(d.sessionID)
+      case "session.execution.failed":
+        return bridge.onIdle(d.sessionID, `${d.error?.type ?? "error"}: ${clip(String(d.error?.message ?? ""), 500)}`)
+      case "session.execution.interrupted":
+        return bridge.onIdle(d.sessionID, `interrupted (${d.reason ?? "unknown"})`)
+      case "form.created":
+        return this.onForm(bridge, d.form, directory)
+      case "form.replied":
+      case "form.cancelled":
+        return bridge.onQuestionDone(d.id)
+    }
+  }
+
+  /** Dormant while QUESTION_GUARD is on, and until opencode exposes ctx.session.form to plugins. */
+  private async onForm(bridge: Bridge, form: any, directory: string | undefined) {
+    if (bridge.opts.questionGuard) return
+    // "global" is MCP elicitation's sentinel, not a session; leave those to the TUI.
+    if (!form?.id || !form.sessionID || form.sessionID === "global") return
+    const ctx = this.at(directory)
+    const api = ctx.session?.form
+    if (!api?.reply) return
+    const parsed = formQuestions(form)
+    if (!parsed) return
+    const { sessionID, id: formID } = form
+    await bridge.askQuestion({
+      id: formID,
+      sessionID,
+      questions: parsed.questions,
+      answer: async (answers) => {
+        try {
+          await api.reply({ sessionID, formID, answer: formAnswer(parsed.fields, answers) })
+          return true
+        } catch {
+          return false
+        }
+      },
+      dismiss: async () => {
+        try {
+          await api.cancel({ sessionID, formID })
+          return true
+        } catch {
+          return false
+        }
+      },
+    })
+  }
+}
+
+function hostV2(reg: V2Registry, guard: boolean): Host {
   const ref = (s: any): SessionRef | undefined =>
-    s?.id ? { id: s.id, title: s.title, parentID: s.parentID, updated: millis(s.time?.updated) } : undefined
+    s?.id
+      ? {
+          id: s.id,
+          title: s.title,
+          parentID: s.parentID,
+          updated: millis(s.time?.updated),
+          directory: s.location?.directory,
+        }
+      : undefined
   return {
+    multiProject: true,
     log(level, message, extra) {
       if (level === "debug") return
       const line = `[whatsapp-agent] ${message}${extra ? " " + JSON.stringify(extra) : ""}`
@@ -403,43 +588,72 @@ function hostV2(ctx: ContextV2): Host {
     },
     async getSession(id) {
       try {
-        return ref(await c.session.get({ sessionID: id }))
+        return ref(await reg.any().session.get({ sessionID: id }))
       } catch {
         return undefined
       }
     },
-    async createSession(title) {
+    async createSession(title, directory) {
       const input: any = { title }
+      if (directory) input.location = { directory }
       if (process.env.WHATSAPP_AGENT_AGENT) input.agent = process.env.WHATSAPP_AGENT_AGENT
       const model = envModel()
       if (model) input.model = { providerID: model.providerID, id: model.modelID }
-      return ref(await c.session.create(input))
+      if (guard) input.permissions = [DENY_QUESTION]
+      return ref(await reg.any().session.create(input))
     },
+    denyQuestions: guard
+      ? async (sessionID) => {
+          try {
+            const c = reg.any()
+            const rules: any[] = (await c.session.get({ sessionID }))?.permissions ?? []
+            if (isDenyQuestion(rules.at(-1))) return undefined
+            await c.session.update({ sessionID, permissions: [...rules, DENY_QUESTION] })
+            return undefined
+          } catch (e) {
+            return String(e)
+          }
+        }
+      : undefined,
+    allowQuestions: guard
+      ? async (sessionID) => {
+          try {
+            const c = reg.any()
+            const rules: any[] = (await c.session.get({ sessionID }))?.permissions ?? []
+            const i = rules.findLastIndex(isDenyQuestion)
+            if (i < 0) return undefined
+            await c.session.update({ sessionID, permissions: rules.filter((_, j) => j !== i) })
+            return undefined
+          } catch (e) {
+            return String(e)
+          }
+        }
+      : undefined,
     async listSessions() {
-      const page = await c.session.list({ directory: ctx.location.directory, limit: 30 })
+      const page = await reg.any().session.list({ limit: 30 })
       return (page?.data ?? []).map(ref).filter(Boolean) as SessionRef[]
     },
     async prompt(sessionID, text) {
       try {
-        await c.session.prompt({ sessionID, text })
+        await reg.any().session.prompt({ sessionID, text })
         return undefined
       } catch (e) {
         return clip(String(e), 300)
       }
     },
-    async listModels() {
-      const res = await c.model.list({ location: { directory: ctx.location.directory }, types: ["chat"] })
+    async listModels(directory) {
+      const res = await reg.at(directory).model.list({ types: ["chat"] })
       return ((res?.data ?? []) as any[])
         .filter((m) => m?.enabled !== false && (!m.type || m.type === "chat"))
         .map((m) => ({ providerID: m.providerID, modelID: m.id, name: m.name }))
     },
-    async defaultModel() {
-      const m = (await c.model.default({ location: { directory: ctx.location.directory } }))?.data
+    async defaultModel(directory) {
+      const m = (await reg.at(directory).model.default())?.data
       return m ? { providerID: m.providerID, modelID: m.id, name: m.name } : undefined
     },
     async sessionModel(sessionID) {
       try {
-        const m = (await c.session.get({ sessionID }))?.model
+        const m = (await reg.any().session.get({ sessionID }))?.model
         return m ? { providerID: m.providerID, modelID: m.id } : undefined
       } catch {
         return undefined
@@ -447,17 +661,17 @@ function hostV2(ctx: ContextV2): Host {
     },
     async setModel(sessionID, model) {
       try {
-        await c.session.switchModel({ sessionID, model: { providerID: model.providerID, id: model.modelID } })
+        await reg.any().session.switchModel({ sessionID, model: { providerID: model.providerID, id: model.modelID } })
         return undefined
       } catch (e) {
         return clip(String(e), 300)
       }
     },
     async abort(sessionID) {
-      await c.session.interrupt({ sessionID })
+      await reg.any().session.interrupt({ sessionID })
     },
     async finalReply(sessionID, since) {
-      const messages: any[] = (await c.session.context({ sessionID })) ?? []
+      const messages: any[] = (await reg.any().session.context({ sessionID })) ?? []
       const last = messages
         .filter((m) => m?.type === "assistant" && millis(m.time?.created) >= since - 2000)
         .sort((a, b) => millis(a.time.created) - millis(b.time.created))
@@ -469,9 +683,10 @@ function hostV2(ctx: ContextV2): Host {
       const err = last?.error
       return { text, error: err ? `${err.type ?? "error"}: ${clip(String(err.message ?? ""), 500)}` : undefined }
     },
-    async reply(sessionID, requestID, reply) {
+    async reply(req, reply) {
       try {
-        await c.permission.reply({ sessionID, requestID, decision: reply })
+        // Pending permissions live in the raising project's permission service.
+        await reg.at(req.directory).permission.reply({ sessionID: req.sessionID, requestID: req.id, decision: reply })
         return true
       } catch {
         return false
@@ -589,6 +804,7 @@ class Bridge {
   private awaiting = new Map<string, { since: number; wamid: string }>()
   private typing = new Map<string, ReturnType<typeof setInterval>>()
   private lastList: string[] = []
+  private lastProjects: string[] = []
   private lastModels: ModelRef[] = []
   private rootCache = new Map<string, string>()
   private wa: WhatsApp
@@ -618,9 +834,9 @@ class Bridge {
   private load(): State {
     try {
       const s = JSON.parse(readFileSync(this.statePath, "utf8"))
-      return { sessions: {}, driven: [], models: {}, ...s }
+      return { sessions: {}, models: {}, ...s }
     } catch {
-      return { sessions: {}, driven: [], models: {} }
+      return { sessions: {}, models: {} }
     }
   }
 
@@ -649,7 +865,6 @@ class Bridge {
   stop() {
     this.stopped = true
     this.abort.abort()
-    for (const state of this.questionsById.values()) state.req.abandon?.()
     this.questionsById.clear()
     this.questionsByWamid.clear()
     for (const t of this.typing.values()) clearInterval(t)
@@ -769,26 +984,66 @@ class Bridge {
 
   // ------------------------------------------------------------ sessions
 
-  private current() {
-    return this.state.sessions[this.directory]
+  /** V2 tracks one current session across projects; V1 one per project. */
+  private get key() {
+    return this.host.multiProject ? "*" : this.directory
   }
 
-  private setCurrent(id: string) {
-    this.state.sessions[this.directory] = id
+  private current(): string | undefined {
+    return this.state.sessions[this.key] ?? (this.host.multiProject ? this.state.sessions[this.directory] : undefined)
+  }
+
+  private setCurrent(id: string | undefined) {
+    if (id) this.state.sessions[this.key] = id
+    else delete this.state.sessions[this.key]
     this.save()
   }
 
-  private markDriven(id: string) {
-    if (!this.state.driven.includes(id)) {
-      this.state.driven = [...this.state.driven, id].slice(-50)
-      this.save()
+  /** Where new sessions go: /cd's pick (V2), else the project the bridge started in. */
+  private cwd() {
+    return (this.host.multiProject && this.state.cwd) || this.directory
+  }
+
+  /**
+   * Switches the current session: the one left behind gets the question tool back (TUI forms work there
+   * again), the new one has it turned off. Resolves to an error description for the new session, or undefined.
+   */
+  private async switchSession(id: string | undefined) {
+    const prev = this.current()
+    this.setCurrent(id)
+    if (prev && prev !== id) {
+      await this.leave(prev)
+      const err = await this.host.allowQuestions?.(prev)
+      if (err) this.log("warn", "could not restore the question tool", { sessionID: prev, error: err })
+    }
+    return id ? this.host.denyQuestions?.(id) : undefined
+  }
+
+  /** True for the current session and its subagents: the only ones WhatsApp sees (unless forward=all). */
+  private async isCurrent(sessionID: string) {
+    const cur = this.current()
+    return !!cur && (sessionID === cur || (await this.root(sessionID)) === cur)
+  }
+
+  /** Stops following a session we switched away from: no reply, no typing, its prompts stay in the TUI. */
+  private async leave(sessionID: string) {
+    this.awaiting.delete(sessionID)
+    this.stopTyping(sessionID)
+    if (this.opts.forward === "all") return
+    for (const [wamid, req] of [...this.pendingByWamid]) {
+      if ((await this.root(req.sessionID)) !== sessionID) continue
+      this.pendingByWamid.delete(wamid)
+      this.wamidByRequest.delete(req.id)
+    }
+    for (const state of [...this.questionsById.values()]) {
+      if ((await this.root(state.req.sessionID)) === sessionID) this.dropQuestion(state.req.id)
     }
   }
 
   private async ensureSession() {
     const id = this.current()
     if (id && (await this.host.getSession(id))) return id
-    const created = await this.host.createSession("WhatsApp")
+    const created = await this.host.createSession("WhatsApp", this.cwd())
     if (!created) throw new Error("could not create session")
     this.setCurrent(created.id)
     return created.id
@@ -802,7 +1057,6 @@ class Bridge {
       await this.say(`⚠️ ${String(e)}`, m.id)
       return
     }
-    this.markDriven(sessionID)
     if (!this.awaiting.has(sessionID)) this.awaiting.set(sessionID, { since: Date.now(), wamid: m.id })
     const error = await this.host.prompt(sessionID, text, this.state.models[sessionID])
     if (error) {
@@ -857,6 +1111,11 @@ class Bridge {
     const err = reply.error ?? hint
     if (err) text = `${text ? text + "\n\n" : ""}⚠️ ${err}`
     if (!text) text = "✅ Done (no text reply)."
+    await this.sendLong(text, wait.wamid)
+  }
+
+  /** Markdown -> WhatsApp, split under the size cap, at most MAX_CHUNKS messages; the first quotes `quote`. */
+  private async sendLong(text: string, quote?: string) {
     let parts = chunk(toWhatsApp(text))
     if (parts.length > MAX_CHUNKS) {
       parts = parts.slice(0, MAX_CHUNKS)
@@ -864,7 +1123,7 @@ class Bridge {
     }
     for (let i = 0; i < parts.length; i++) {
       const suffix = parts.length > 1 ? `\n(${i + 1}/${parts.length})` : ""
-      await this.say(parts[i] + suffix, i === 0 ? wait.wamid : undefined)
+      await this.say(parts[i] + suffix, i === 0 ? quote : undefined)
     }
   }
 
@@ -872,10 +1131,7 @@ class Bridge {
 
   async onPermissionAsked(p: PermissionRequest) {
     if (!p?.id || !p.sessionID || !this.state.creator || this.wamidByRequest.has(p.id)) return
-    if (this.opts.forward === "whatsapp") {
-      const root = await this.root(p.sessionID)
-      if (!this.state.driven.includes(root) && !this.state.driven.includes(p.sessionID)) return
-    }
+    if (this.opts.forward === "whatsapp" && !(await this.isCurrent(p.sessionID))) return
     this.wamidByRequest.set(p.id, "") // reserve: avoid a duplicate send while this one is in flight
     const wamid = await this.say(describePermission(p))
     if (!wamid) {
@@ -898,7 +1154,7 @@ class Bridge {
     const wamid = this.wamidByRequest.get(req.id)
     if (wamid) this.pendingByWamid.delete(wamid)
     this.wamidByRequest.delete(req.id)
-    if (!(await this.host.reply(req.sessionID, req.id, reply))) {
+    if (!(await this.host.reply(req, reply))) {
       await this.say("That request was already answered or has expired.", wamid || undefined)
       return
     }
@@ -921,17 +1177,13 @@ class Bridge {
   }
 
   /**
-   * Forwards a question. `scope` "driven" only takes questions from WhatsApp-driven sessions (V2 wraps the
-   * tool, so anything not taken stays in the TUI); "forward" follows WHATSAPP_AGENT_FORWARD like permissions.
+   * Forwards a question, following WHATSAPP_AGENT_FORWARD like permissions.
    * Resolves to true when the question was sent to WhatsApp.
    */
-  async askQuestion(req: QuestionRequest, scope: "driven" | "forward"): Promise<boolean> {
+  async askQuestion(req: QuestionRequest): Promise<boolean> {
     if (this.stopped || !req?.id || !req.sessionID || !req.questions?.length || !this.state.creator) return false
     if (this.questionsById.has(req.id)) return true
-    if (scope === "driven" || this.opts.forward === "whatsapp") {
-      const root = await this.root(req.sessionID)
-      if (!this.state.driven.includes(root) && !this.state.driven.includes(req.sessionID)) return false
-    }
+    if (this.opts.forward === "whatsapp" && !(await this.isCurrent(req.sessionID))) return false
     const state: QuestionState = { req, index: 0, answers: [] }
     this.questionsById.set(req.id, state)
     const wamid = await this.say(describeQuestion(req.questions[0], 0, req.questions.length))
@@ -945,37 +1197,7 @@ class Bridge {
     return true
   }
 
-  /** V2: ask and wait for the answers. Undefined means "not taken": let the original tool ask in the TUI. */
-  async askQuestionAndWait(sessionID: string, id: string, questions: Question[], signal?: AbortSignal) {
-    let resolve!: (a: string[][]) => void
-    let reject!: (e: Error) => void
-    const done = new Promise<string[][]>((res, rej) => ((resolve = res), (reject = rej)))
-    const taken = await this.askQuestion(
-      {
-        id,
-        sessionID,
-        questions,
-        answer: async (answers) => (resolve(answers), true),
-        dismiss: async () => (reject(new Error("The user dismissed this question")), true),
-        abandon: () => reject(new Error("The WhatsApp bridge stopped before the question was answered")),
-      },
-      "driven",
-    )
-    if (!taken) return undefined
-    const onAbort = () => {
-      this.dropQuestion(id)
-      reject(new Error("The question was interrupted"))
-    }
-    if (signal?.aborted) onAbort()
-    signal?.addEventListener("abort", onAbort, { once: true })
-    try {
-      return await done
-    } finally {
-      signal?.removeEventListener("abort", onAbort)
-    }
-  }
-
-  /** V1: answered or rejected in the TUI. */
+  /** Answered, rejected or cancelled in the TUI. */
   onQuestionDone(id: string | undefined) {
     if (id) this.dropQuestion(id)
   }
@@ -1014,14 +1236,14 @@ class Bridge {
     if (own) return { model: own, source: "session" }
     const env = envModel()
     if (env) return { model: env, source: "WHATSAPP_AGENT_MODEL" }
-    const def = await this.host.defaultModel().catch(() => undefined)
+    const def = await this.host.defaultModel(this.cwd()).catch(() => undefined)
     return def ? { model: def, source: "opencode default" } : undefined
   }
 
   private async models(filter: string, m: WaMessage) {
     let all: ModelRef[]
     try {
-      all = (await this.host.listModels()).sort((a, b) => modelKey(a).localeCompare(modelKey(b)))
+      all = (await this.host.listModels(this.cwd())).sort((a, b) => modelKey(a).localeCompare(modelKey(b)))
     } catch (e) {
       return void (await this.say(`⚠️ Could not list models: ${clip(String(e), 200)}`, m.id))
     }
@@ -1031,7 +1253,7 @@ class Bridge {
     const shown = list.slice(0, 30)
     this.lastModels = shown
     const current = await this.effectiveModel(this.current())
-    const def = await this.host.defaultModel().catch(() => undefined)
+    const def = await this.host.defaultModel(this.cwd()).catch(() => undefined)
     const lines = shown.map((x, i) => {
       const mark = current && modelKey(current.model) === modelKey(x) ? "▶️ " : ""
       const star = def && modelKey(def) === modelKey(x) ? " ⭐" : ""
@@ -1050,7 +1272,7 @@ class Bridge {
     let pick: ModelRef | undefined
     if (Number.isInteger(n) && n >= 1) pick = this.lastModels[n - 1]
     else {
-      const all = await this.host.listModels().catch(() => [] as ModelRef[])
+      const all = await this.host.listModels(this.cwd()).catch(() => [] as ModelRef[])
       pick = all.find((x) => modelKey(x).toLowerCase() === arg.toLowerCase())
     }
     if (!pick) return void (await this.say("Unknown model. Run /models and pick a number, or use provider/model.", m.id))
@@ -1070,6 +1292,36 @@ class Bridge {
     await this.say(`🧠 Now using ${modelKey(pick)}${name && name !== pick.modelID ? ` · ${name}` : ""}`, m.id)
   }
 
+  // ------------------------------------------------------------ projects
+
+  /** "/cd" lists projects (from recent sessions); "/cd <n>" or "/cd <absolute path>" picks one for new sessions. */
+  private async cd(arg: string, m: WaMessage) {
+    if (!this.host.multiProject) return void (await this.say(`This opencode version stays in ${this.directory}.`, m.id))
+    if (!arg) {
+      const recent = (await this.host.listSessions().catch(() => [] as SessionRef[]))
+        .sort((a, b) => b.updated - a.updated)
+        .map((s) => s.directory)
+      this.lastProjects = [...new Set([this.cwd(), this.directory, ...recent].filter(Boolean) as string[])].slice(0, 10)
+      const lines = this.lastProjects.map((d, i) => `${i + 1}. ${d === this.cwd() ? "▶️ " : ""}${tilde(d)}`)
+      return void (await this.say(`Projects:\n${lines.join("\n")}\n\nPick with /cd <n> or /cd <path>`, m.id))
+    }
+    const n = Number(arg)
+    let dir = Number.isInteger(n) && n >= 1 ? this.lastProjects[n - 1] : undefined
+    if (!dir) {
+      const path = arg === "~" ? homedir() : arg.startsWith("~/") ? join(homedir(), arg.slice(2)) : arg
+      if (!isAbsolute(path)) return void (await this.say("Use /cd <n> from the list, or an absolute path.", m.id))
+      dir = resolve(path)
+      let ok = false
+      try {
+        ok = statSync(dir).isDirectory()
+      } catch {}
+      if (!ok) return void (await this.say(`Not a folder: ${tilde(dir)}`, m.id))
+    }
+    this.state.cwd = dir
+    await this.switchSession(undefined) // the next message starts a session there
+    await this.say(`📁 ${tilde(dir)}\nYour next message starts a new session here (or /use one).`, m.id)
+  }
+
   // ------------------------------------------------------------ commands
 
   private async command(text: string, m: WaMessage) {
@@ -1077,31 +1329,43 @@ class Bridge {
     const arg = rest.join(" ").trim()
     switch (cmd.toLowerCase()) {
       case "/new": {
-        const created = await this.host.createSession(arg || "WhatsApp")
+        const created = await this.host.createSession(arg || "WhatsApp", this.cwd())
         if (!created) return void (await this.say("⚠️ Could not create a session.", m.id))
-        this.setCurrent(created.id)
-        return void (await this.say(`🆕 New session: *${created.title || arg || "WhatsApp"}*`, m.id))
+        await this.switchSession(created.id)
+        const where = this.host.multiProject ? ` in ${tilde(created.directory ?? this.cwd())}` : ""
+        return void (await this.say(`🆕 New session: *${created.title || arg || "WhatsApp"}*${where}`, m.id))
       }
       case "/sessions": {
         const list = (await this.host.listSessions())
           .filter((s) => !s.parentID)
           .sort((a, b) => b.updated - a.updated)
-          .slice(0, 8)
+          .slice(0, this.host.multiProject ? 12 : 8)
         this.lastList = list.map((s) => s.id)
         if (!list.length) return void (await this.say("No sessions yet. Send a message to start one.", m.id))
         const cur = this.current()
         const lines = list.map(
-          (s, i) => `${i + 1}. ${s.id === cur ? "▶️ " : ""}${clip(s.title || "untitled", 60)} · ${ago(s.updated)}`,
+          (s, i) =>
+            `${i + 1}. ${s.id === cur ? "▶️ " : ""}${clip(s.title || "untitled", 50)}` +
+            `${this.host.multiProject && s.directory ? ` · ${clip(tilde(s.directory), 40)}` : ""} · ${ago(s.updated)}`,
         )
-        return void (await this.say(`Sessions in ${this.directory}:\n${lines.join("\n")}\n\nSwitch with /use <n>`, m.id))
+        const head = this.host.multiProject ? "Recent sessions:" : `Sessions in ${this.directory}:`
+        return void (await this.say(`${head}\n${lines.join("\n")}\n\nSwitch with /use <n>`, m.id))
       }
+      case "/cd":
+        return this.cd(arg, m)
       case "/use": {
         const n = Number(arg)
         const id = Number.isInteger(n) && n >= 1 ? this.lastList[n - 1] : arg.startsWith("ses") ? arg : undefined
         const got = id ? await this.host.getSession(id) : undefined
         if (!got) return void (await this.say("Unknown session. Run /sessions first.", m.id))
-        this.setCurrent(got.id)
-        return void (await this.say(`▶️ Now chatting in *${got.title || "untitled"}*`, m.id))
+        const err = await this.switchSession(got.id)
+        const note = err ? `\n⚠️ Couldn't turn off the question tool: ${clip(err, 200)}` : ""
+        const where = this.host.multiProject && got.directory ? ` · ${tilde(got.directory)}` : ""
+        await this.say(`▶️ Now chatting in *${got.title || "untitled"}*${where}${note}`, m.id)
+        // Where you left off: the session's last assistant reply.
+        const last = await this.host.finalReply(got.id, 0).catch(() => undefined)
+        if (last?.text) await this.sendLong(`💬 Last reply:\n\n${last.text}`)
+        return
       }
       case "/skip": {
         const state = this.latestQuestion()
@@ -1124,9 +1388,10 @@ class Bridge {
         const id = this.current()
         const got = id ? await this.host.getSession(id) : undefined
         const model = await this.effectiveModel(got ? id : undefined)
+        const folder = got?.directory ?? this.cwd()
         return void (await this.say(
           [
-            `📁 ${this.directory}`,
+            `📁 ${tilde(folder)}${this.host.multiProject && folder !== this.cwd() ? ` · /new goes to ${tilde(this.cwd())}` : ""}`,
             `💬 ${got?.title ? `*${got.title}*` : got ? "untitled session" : "no session yet"}`,
             `🧠 ${model ? `${modelKey(model.model)} (${model.source})` : "model not resolved"}`,
             `🔐 ${this.pendingByWamid.size} pending approval(s) · ❓ ${this.questionsById.size} question(s) · forwarding: ${this.opts.forward}`,
@@ -1142,6 +1407,7 @@ class Bridge {
             "/new [title] · new session",
             "/sessions · list recent sessions",
             "/use <n> · switch session",
+            ...(this.host.multiProject ? ["/cd [n | path] · pick the project for new sessions"] : []),
             "/models [text] · list models (filter by text)",
             "/model [n | provider/model] · show or switch this session's model",
             "/stop · abort the running turn",
@@ -1174,6 +1440,7 @@ function startBridge(host: Host, directory: string, raw: unknown) {
       sendIntervalMs: opts.sendIntervalMs ?? 5100,
       pollFloorMs: opts.pollFloorMs ?? 4100,
       pollTimeoutSec: Math.min(Math.max(opts.pollTimeoutSec ?? 25, 0), 25),
+      questionGuard: opts.questionGuard ?? QUESTION_GUARD,
     },
     key,
     resolveBaseUrl(opts.baseUrl ?? process.env.WHATSAPP_AGENT_BASE_URL),
@@ -1216,16 +1483,13 @@ const server: PluginV1 = async (input, options) => {
         else if (e.type === "session.idle") await bridge.onIdle(e.properties?.sessionID)
         else if (e.type === "question.asked") {
           const p = e.properties ?? {}
-          await bridge.askQuestion(
-            {
-              id: p.id,
-              sessionID: p.sessionID,
-              questions: p.questions ?? [],
-              answer: (answers) => questionPost("reply", p.id, { answers }),
-              dismiss: () => questionPost("reject", p.id),
-            },
-            "forward",
-          )
+          await bridge.askQuestion({
+            id: p.id,
+            sessionID: p.sessionID,
+            questions: p.questions ?? [],
+            answer: (answers) => questionPost("reply", p.id, { answers }),
+            dismiss: () => questionPost("reject", p.id),
+          })
         } else if (e.type === "question.replied" || e.type === "question.rejected")
           bridge.onQuestionDone(e.properties?.requestID)
       } catch (err) {
@@ -1243,75 +1507,19 @@ const V2_EVENTS = [
   "session.execution.failed",
   "session.execution.interrupted",
 ]
+const V2_FORM_EVENTS = ["form.created", "form.replied", "form.cancelled"]
 
-/** V2 entrypoint (opencode 2.x). */
+/** V2 entrypoint (opencode 2.x): runs once per project the server loads. */
 async function setup(ctx: ContextV2) {
-  const bridge = startBridge(hostV2(ctx), ctx.location.directory, ctx.options)
-  if (!bridge) return
-  // V2 asks questions through forms, and plugins can't answer forms. Wrap the question tool instead:
-  // for WhatsApp-driven sessions it asks over WhatsApp; everything else falls through to the TUI form.
-  await ctx.tool.transform((editor) => {
-    const tool = editor.list().find((t) => t.name === "question")
-    if (!tool) return
-    editor.update(tool.id, (t) => {
-      const original = t.execute
-      t.execute = async (input: any, context) => {
-        const questions: Question[] = input?.questions ?? []
-        const answers = bridge.stopped
-          ? undefined
-          : await bridge.askQuestionAndWait(context.sessionID, String(context.id), questions, context.signal)
-        if (answers === undefined) return original(input, context)
-        return { output: { answers }, content: answersText(questions, answers), metadata: { answers } }
-      }
-    })
-  })
-  const controller = new AbortController()
-  void (async () => {
-    try {
-      const stream = (ctx.event as any).subscribe({ types: V2_EVENTS, signal: controller.signal })
-      for await (const event of stream as AsyncIterable<any>) {
-        const d = event?.data ?? {}
-        try {
-          switch (event?.type) {
-            case "permission.asked": {
-              // In "all" mode, stay within this project like V1 does (the V2 stream is server-wide).
-              const dir = event.location?.directory
-              if (bridge.opts.forward === "all" && dir && dir !== ctx.location.directory) break
-              await bridge.onPermissionAsked({
-                id: d.id,
-                sessionID: d.sessionID,
-                permission: d.action,
-                patterns: d.resources,
-                always: d.save,
-                metadata: d.metadata,
-              })
-              break
-            }
-            case "permission.replied":
-              bridge.onPermissionReplied(d.requestID)
-              break
-            case "session.execution.succeeded":
-              await bridge.onIdle(d.sessionID)
-              break
-            case "session.execution.failed":
-              await bridge.onIdle(d.sessionID, `${d.error?.type ?? "error"}: ${clip(String(d.error?.message ?? ""), 500)}`)
-              break
-            case "session.execution.interrupted":
-              await bridge.onIdle(d.sessionID, `interrupted (${d.reason ?? "unknown"})`)
-              break
-          }
-        } catch (err) {
-          bridge.log("error", `event ${event?.type} failed`, { error: String(err) })
-        }
-      }
-    } catch (err) {
-      if (!controller.signal.aborted) bridge.log("error", "event stream ended", { error: String(err) })
-    }
-  })()
-  return () => {
-    controller.abort()
-    stopBridge(bridge)
+  const g = globalThis as any
+  const reg: V2Registry = (g[REGISTRY_KEY] ??= new V2Registry())
+  reg.add(ctx)
+  if (!reg.bridge || reg.bridge.stopped) {
+    const guard = (ctx.options as Options | undefined)?.questionGuard ?? QUESTION_GUARD
+    reg.bridge = startBridge(hostV2(reg, guard), ctx.location.directory, ctx.options)
+    reg.listen()
   }
+  return () => reg.remove(ctx)
 }
 
 // V2 calls setup(ctx); V1 calls server(input). Same shape as @opencode/plugin's Plugin.define({ id, setup }).

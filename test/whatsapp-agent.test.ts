@@ -462,7 +462,11 @@ test("stops polling when another poller replaces it (409)", async () => {
 
 // ---------------------------------------------------------------- V2 (opencode 2.x: setup(ctx))
 
-function fakeV2(options: Record<string, unknown>) {
+/**
+ * Fake V2 server: one session store and event stream shared by every project context (opencode runs one
+ * plugin instance per project). Calls record `via`, the project whose context made them.
+ */
+function fakeV2(options: Record<string, unknown>, opts: { forms?: boolean } = {}) {
   const sessions = new Map<string, any>()
   const context = new Map<string, any[]>()
   const calls: { method: string; args: any }[] = []
@@ -470,100 +474,111 @@ function fakeV2(options: Record<string, unknown>) {
   let wake: (() => void) | undefined
   let seq = 0
   const rec = (method: string, args: any) => calls.push({ method, args })
-  const tools: any = {
-    question: {
-      id: "question",
-      name: "question",
-      execute: async (input: any) => {
-        rec("question.original", input)
-        return { output: { answers: [["from-tui"]] }, content: "tui" }
+
+  const project = (directory: string): any => {
+    const via = { via: directory }
+    return {
+      location: { directory, project: { id: `prj_${directory}`, directory, canonical: directory } },
+      options,
+      session: {
+        create: async (input: any) => {
+          rec("session.create", { ...input, ...via })
+          const s = {
+            id: `ses_v2_${++seq}`,
+            title: input?.title,
+            permissions: input?.permissions,
+            location: { directory: input?.location?.directory ?? directory },
+            time: { created: Date.now(), updated: Date.now() + seq },
+          }
+          sessions.set(s.id, s)
+          return s
+        },
+        get: async ({ sessionID }: any) => {
+          const s = sessions.get(sessionID)
+          if (!s) throw new Error("Session.NotFound")
+          return s
+        },
+        list: async (input: any) => {
+          rec("session.list", input)
+          return { data: [...sessions.values()], cursor: {} }
+        },
+        prompt: async (input: any) => {
+          rec("session.prompt", input)
+          return { id: "inb_1" }
+        },
+        interrupt: async (input: any) => {
+          rec("session.interrupt", input)
+          return { interrupted: true }
+        },
+        context: async ({ sessionID }: any) => context.get(sessionID) ?? [],
+        switchModel: async (input: any) => {
+          rec("session.switchModel", input)
+          const s = sessions.get(input.sessionID)
+          if (s) s.model = input.model
+        },
+        update: async (input: any) => {
+          rec("session.update", input)
+          const s = sessions.get(input.sessionID)
+          if (s && input.permissions) s.permissions = input.permissions
+        },
+        // anomalyco/opencode#59655 shape; only present when the test opts in.
+        ...(opts.forms
+          ? {
+              form: {
+                reply: async (input: any) => {
+                  rec("form.reply", { ...input, ...via })
+                  if (input.formID === "frm_gone") throw new Error("Form.NotFound")
+                },
+                cancel: async (input: any) => rec("form.cancel", { ...input, ...via }),
+              },
+            }
+          : {}),
       },
-    },
-  }
-  const ctx: any = {
-    location: { directory: "/proj", project: { id: "prj_1", directory: "/proj", canonical: "/proj" } },
-    options,
-    session: {
-      create: async (input: any) => {
-        rec("session.create", input)
-        const s = { id: `ses_v2_${++seq}`, title: input?.title, time: { created: Date.now(), updated: Date.now() } }
-        sessions.set(s.id, s)
-        return s
-      },
-      get: async ({ sessionID }: any) => {
-        const s = sessions.get(sessionID)
-        if (!s) throw new Error("Session.NotFound")
-        return s
-      },
-      list: async (input: any) => {
-        rec("session.list", input)
-        return { data: [...sessions.values()], cursor: {} }
-      },
-      prompt: async (input: any) => {
-        rec("session.prompt", input)
-        return { id: "inb_1" }
-      },
-      interrupt: async (input: any) => {
-        rec("session.interrupt", input)
-        return { interrupted: true }
-      },
-      context: async ({ sessionID }: any) => context.get(sessionID) ?? [],
-      switchModel: async (input: any) => {
-        rec("session.switchModel", input)
-        const s = sessions.get(input.sessionID)
-        if (s) s.model = input.model
-      },
-    },
-    model: {
-      list: async (input: any) => {
-        rec("model.list", input)
-        return {
-          data: [
-            { id: "big-pickle", providerID: "opencode", name: "Big Pickle", type: "chat", enabled: true },
-            { id: "gpt-img", providerID: "openai", name: "Image", type: "image", enabled: true },
-            { id: "old", providerID: "openai", name: "Old", type: "chat", enabled: false },
-            { id: "qwen", providerID: "rapid-mlx", name: "Qwen", enabled: true },
-          ],
-        }
-      },
-      default: async () => ({ data: { id: "qwen", providerID: "rapid-mlx", name: "Qwen" } }),
-    },
-    permission: {
-      reply: async (input: any) => {
-        rec("permission.reply", input)
-        if (input.requestID === "per_gone") throw new Error("Permission.NotFound")
-      },
-    },
-    tool: {
-      // One built-in "question" tool whose original execute stands in for the TUI form.
-      transform: async (callback: (editor: any) => void) => {
-        const editor = {
-          list: () => [tools.question],
-          update: (id: string, fn: (t: any) => void) => {
-            if (id === tools.question.id) fn(tools.question)
-          },
-        }
-        callback(editor)
-      },
-    },
-    event: {
-      subscribe: ({ signal }: { signal: AbortSignal }) => ({
-        async *[Symbol.asyncIterator]() {
-          while (!signal.aborted) {
-            if (queue.length) yield queue.shift()
-            else await new Promise<void>((r) => ((wake = r), signal.addEventListener("abort", () => r(), { once: true })))
+      model: {
+        list: async (input: any) => {
+          rec("model.list", { ...input, ...via })
+          return {
+            data: [
+              { id: "big-pickle", providerID: "opencode", name: "Big Pickle", type: "chat", enabled: true },
+              { id: "gpt-img", providerID: "openai", name: "Image", type: "image", enabled: true },
+              { id: "old", providerID: "openai", name: "Old", type: "chat", enabled: false },
+              { id: "qwen", providerID: "rapid-mlx", name: "Qwen", enabled: true },
+            ],
           }
         },
-      }),
-    },
+        default: async () => ({ data: { id: "qwen", providerID: "rapid-mlx", name: "Qwen" } }),
+      },
+      permission: {
+        reply: async (input: any) => {
+          rec("permission.reply", { ...input, ...via })
+          if (input.requestID === "per_gone") throw new Error("Permission.NotFound")
+        },
+      },
+      tool: {
+        transform: async () => rec("tool.transform", via),
+      },
+      event: {
+        subscribe: ({ types, signal }: { types: string[]; signal: AbortSignal }) => {
+          rec("event.subscribe", { types, ...via })
+          return {
+            async *[Symbol.asyncIterator]() {
+              while (!signal.aborted) {
+                if (queue.length) yield queue.shift()
+                else
+                  await new Promise<void>((r) => ((wake = r), signal.addEventListener("abort", () => r(), { once: true })))
+              }
+            },
+          }
+        },
+      },
+    }
   }
+
   return {
-    ctx,
+    ctx: project("/proj"),
+    project,
     calls,
     sessions,
-    /** Runs the (possibly wrapped) question tool as the model would. */
-    question: (sessionID: string, questions: any[], signal = new AbortController().signal) =>
-      tools.question.execute({ questions }, { sessionID, id: "call_q1", messageID: "msg_1", agent: "build", signal }),
     emit(type: string, data: any, location = { directory: "/proj" }) {
       queue.push({ id: "evt_1", created: Date.now(), type, location, data })
       wake?.()
@@ -576,11 +591,18 @@ function fakeV2(options: Record<string, unknown>) {
   }
 }
 
-async function bootV2(extra: Record<string, unknown> = {}) {
-  const v2 = fakeV2({ apiKey: "test-key", baseUrl: wa.url, stateDir, sendIntervalMs: 1, pollFloorMs: 1, pollTimeoutSec: 0, ...extra })
-  const cleanup = await plugin.setup(v2.ctx)
-  hooks = { dispose: cleanup } // afterEach runs the V2 cleanup
-  return v2
+/** Boots the "/proj" instance; `more` adds instances for other projects. All are disposed after the test. */
+async function bootV2(extra: Record<string, unknown> = {}, opts: { forms?: boolean; more?: string[] } = {}) {
+  const v2 = fakeV2({ apiKey: "test-key", baseUrl: wa.url, stateDir, sendIntervalMs: 1, pollFloorMs: 1, pollTimeoutSec: 0, ...extra }, opts)
+  const cleanups: any[] = [await plugin.setup(v2.ctx)]
+  const others = new Map<string, any>()
+  for (const dir of opts.more ?? []) {
+    const ctx = v2.project(dir)
+    others.set(dir, ctx)
+    cleanups.push(await plugin.setup(ctx))
+  }
+  hooks = { dispose: async () => cleanups.reverse().forEach((c) => c?.()) } // afterEach runs these
+  return { ...v2, others, cleanups }
 }
 
 test("v2: prompt, execution.succeeded, and the final assistant text comes back", async () => {
@@ -608,11 +630,11 @@ test("v2: shell permission (action/resources/save) forwarded; ✅ replies with d
   expect(wa.sent[0].text).toContain("git status *")
   wa.react(wa.sent[0].wamid, "✅")
   await until(() => v2.calls.some((c) => c.method === "permission.reply"))
-  expect(v2.calls.find((c) => c.method === "permission.reply")!.args).toEqual({ sessionID, requestID: "per_v2", decision: "always" })
+  expect(v2.calls.find((c) => c.method === "permission.reply")!.args).toEqual({ sessionID, requestID: "per_v2", decision: "always", via: "/proj" })
 })
 
-test("v2: failed execution reports the event's error; forward=all ignores other projects", async () => {
-  const v2 = await bootV2({ forward: "all" })
+test("v2: failed execution reports the event's error; forward=all covers other projects, replied through theirs", async () => {
+  const v2 = await bootV2({ forward: "all" }, { more: ["/elsewhere"] })
   wa.text("go")
   await until(() => v2.calls.some((c) => c.method === "session.prompt"))
   const sessionID = v2.calls.find((c) => c.method === "session.prompt")!.args.sessionID
@@ -620,36 +642,137 @@ test("v2: failed execution reports the event's error; forward=all ignores other 
   await until(() => wa.sent.length === 1)
   expect(wa.sent[0].text).toBe("⚠️ ProviderError: rate limited")
   v2.emit("permission.asked", { id: "per_other", sessionID: "ses_x", action: "edit", resources: ["a.ts"] }, { directory: "/elsewhere" })
-  v2.emit("permission.asked", { id: "per_here", sessionID: "ses_y", action: "edit", resources: ["b.ts"] })
   await until(() => wa.sent.length === 2)
-  await Bun.sleep(50)
-  expect(wa.sent).toHaveLength(2)
-  expect(wa.sent[1].text).toContain("b.ts")
+  expect(wa.sent[1].text).toContain("a.ts")
+  wa.react(wa.sent[1].wamid, "👍")
+  await until(() => v2.calls.some((c) => c.method === "permission.reply"))
+  expect(v2.calls.find((c) => c.method === "permission.reply")!.args).toEqual({
+    sessionID: "ses_x",
+    requestID: "per_other",
+    decision: "once",
+    via: "/elsewhere",
+  })
 })
 
-test("v2: /sessions lists this directory; /stop interrupts; stale reply handled", async () => {
+test("v2: one bridge for all projects; the event stream moves when its project unloads", async () => {
+  const v2 = await bootV2({}, { more: ["/elsewhere"] })
+  const subs = () => v2.calls.filter((c) => c.method === "event.subscribe")
+  expect(subs()).toHaveLength(1)
+  expect(subs()[0].args.via).toBe("/proj")
+  expect(v2.calls.some((c) => c.method === "tool.transform")).toBe(false) // no question wrapper
+  expect(subs()[0].args.types).not.toContain("form.created") // forms stay off while the guard is on
+  v2.cleanups[0]() // "/proj" unloaded
+  v2.cleanups[0] = undefined
+  await until(() => subs().length === 2)
+  expect(subs()[1].args.via).toBe("/elsewhere")
+  wa.text("/help")
+  await until(() => wa.sent.length === 1) // still polling
+  expect(wa.sent[0].text).toContain("/cd")
+})
+
+test("v2: /sessions spans projects; /cd picks where /new goes; /stop interrupts; stale reply handled", async () => {
   const v2 = await bootV2({ forward: "all" })
+  v2.sessions.set("ses_far", { id: "ses_far", title: "Far", location: { directory: "/far" }, time: { updated: 1 } })
   wa.text("/new Work")
   await until(() => wa.sent.length === 1)
-  expect(wa.sent[0].text).toContain("*Work*")
+  expect(wa.sent[0].text).toBe("🆕 New session: *Work* in /proj")
   wa.text("/sessions")
   await until(() => wa.sent.length === 2)
-  expect(v2.calls.find((c) => c.method === "session.list")!.args.directory).toBe("/proj")
-  expect(wa.sent[1].text).toContain("1. ▶️ Work")
+  expect(v2.calls.find((c) => c.method === "session.list")!.args).toEqual({ limit: 30 })
+  expect(wa.sent[1].text).toContain("1. ▶️ Work · /proj")
+  expect(wa.sent[1].text).toContain("2. Far · /far")
+  wa.text("/cd")
+  await until(() => wa.sent.length === 3)
+  expect(wa.sent[2].text).toContain("1. ▶️ /proj")
+  expect(wa.sent[2].text).toContain("2. /far")
+  wa.text("/cd 2")
+  await until(() => wa.sent.length === 4)
+  expect(wa.sent[3].text).toContain("📁 /far")
+  wa.text("/cd relative/path")
+  await until(() => wa.sent.length === 5)
+  expect(wa.sent[4].text).toContain("absolute path")
+  wa.text("/cd /definitely/not/here")
+  await until(() => wa.sent.length === 6)
+  expect(wa.sent[5].text).toContain("Not a folder")
+  wa.text("hi there")
+  await until(() => v2.calls.some((c) => c.method === "session.prompt"))
+  expect(v2.calls.filter((c) => c.method === "session.create").at(-1)!.args.location).toEqual({ directory: "/far" })
   wa.text("/stop")
   await until(() => v2.calls.some((c) => c.method === "session.interrupt"))
   v2.emit("permission.asked", { id: "per_gone", sessionID: "ses_z", action: "shell", resources: ["rm x"] })
+  await until(() => wa.sent.length === 8)
+  wa.react(wa.sent[7].wamid, "👍")
+  await until(() => wa.sent.length === 9)
+  expect(wa.sent[8].text).toContain("already answered")
+})
+
+test("v2: WhatsApp sees one session at a time; switching drops the old session's reply and prompts", async () => {
+  const v2 = await bootV2()
+  wa.text("work on a")
+  await until(() => v2.calls.some((c) => c.method === "session.prompt"))
+  const a = v2.calls.find((c) => c.method === "session.prompt")!.args.sessionID
+  v2.sessions.set("ses_a_sub", { id: "ses_a_sub", parentID: a, location: { directory: "/proj" }, time: { updated: 1 } })
+  v2.emit("permission.asked", { id: "per_a", sessionID: "ses_a_sub", action: "shell", resources: ["make"] })
+  await until(() => wa.sent.length === 1) // subagent of the current session: forwarded
+  wa.text("/new B")
+  await until(() => wa.sent.length === 2)
+  v2.emit("permission.asked", { id: "per_a2", sessionID: a, action: "shell", resources: ["ls"] })
+  v2.assistant(a, [{ type: "text", text: "a is done" }])
+  v2.emit("session.execution.succeeded", { sessionID: a })
+  await Bun.sleep(60)
+  expect(wa.sent).toHaveLength(2) // nothing from a after the switch
+  wa.text("y") // per_a was dropped on switch, so this is a prompt to B, not an approval
+  await until(() => v2.calls.filter((c) => c.method === "session.prompt").length === 2)
+  expect(v2.calls.some((c) => c.method === "permission.reply")).toBe(false)
+  expect(v2.calls.filter((c) => c.method === "session.prompt").at(-1)!.args.sessionID).not.toBe(a)
+})
+
+test("v2: /use reaches sessions in other projects and resends the last reply", async () => {
+  const v2 = await bootV2()
+  v2.sessions.set("ses_far", { id: "ses_far", title: "Far", location: { directory: "/far" }, time: { updated: 1 } })
+  v2.assistant("ses_far", [{ type: "text", text: "old" }])
+  v2.assistant("ses_far", [{ type: "reasoning", text: "hmm" }, { type: "text", text: "**Left off here**" }])
+  wa.text("/use ses_far")
+  await until(() => wa.sent.length === 2)
+  expect(wa.sent[0].text).toBe("▶️ Now chatting in *Far* · /far")
+  expect(wa.sent[1].text).toBe("💬 Last reply:\n\n*Left off here*")
+  wa.text("do it")
+  await until(() => v2.calls.some((c) => c.method === "session.prompt"))
+  expect(v2.calls.find((c) => c.method === "session.prompt")!.args.sessionID).toBe("ses_far")
+})
+
+test("v2: switching sessions moves the question guard: the one left gets it back, the new one loses it", async () => {
+  const v2 = await bootV2()
+  const deny = { action: "question", resource: "*", effect: "deny" }
+  wa.text("/new Mine")
+  await until(() => wa.sent.length === 1)
+  expect(v2.calls.find((c) => c.method === "session.create")!.args.permissions).toEqual([deny])
+  const mine = [...v2.sessions.keys()][0]
+  const allow = { action: "shell", resource: "git *", effect: "allow" }
+  v2.sessions.set("ses_tui", { id: "ses_tui", title: "TUI", permissions: [allow], time: { updated: Date.now() } })
+  wa.text("/use ses_tui")
+  await until(() => wa.sent.length === 2)
+  expect(wa.sent[1].text).toContain("Now chatting in *TUI*")
+  expect(wa.sent[1].text).not.toContain("Couldn't")
+  expect(v2.sessions.get("ses_tui").permissions).toEqual([allow, deny])
+  expect(v2.sessions.get(mine).permissions).toEqual([])
+  wa.text("/use ses_tui") // same session: nothing to move
+  await until(() => wa.sent.length === 3)
+  expect(v2.calls.filter((c) => c.method === "session.update")).toHaveLength(2)
+  wa.text(`/use ${mine}`)
   await until(() => wa.sent.length === 4)
-  wa.react(wa.sent[3].wamid, "👍")
+  expect(v2.sessions.get("ses_tui").permissions).toEqual([allow])
+  expect(v2.sessions.get(mine).permissions).toEqual([deny])
+  wa.text("/cd /tmp") // no current session afterwards, so the guard is released
   await until(() => wa.sent.length === 5)
-  expect(wa.sent[4].text).toContain("already answered")
+  expect(v2.sessions.get(mine).permissions).toEqual([])
 })
 
 test("v2: /models shows enabled chat models; /model provider/id calls switchModel", async () => {
   const v2 = await bootV2()
   wa.text("/models")
   await until(() => wa.sent.length === 1)
-  expect(v2.calls.find((c) => c.method === "model.list")!.args).toEqual({ location: { directory: "/proj" }, types: ["chat"] })
+  expect(v2.calls.find((c) => c.method === "model.list")!.args).toEqual({ types: ["chat"], via: "/proj" })
   expect(wa.sent[0].text).toContain("1. opencode/big-pickle · Big Pickle")
   expect(wa.sent[0].text).toContain("2. ▶️ rapid-mlx/qwen · Qwen ⭐")
   expect(wa.sent[0].text).not.toContain("gpt-img")
@@ -665,43 +788,70 @@ test("v2: /models shows enabled chat models; /model provider/id calls switchMode
   expect(wa.sent[2].text).toContain("🧠 opencode/big-pickle")
 })
 
-test("v2 question: WhatsApp-driven session answers through the wrapped tool", async () => {
-  const v2 = await bootV2()
+const formFrom = (id: string, sessionID: string, questions: any[]) => ({
+  id,
+  sessionID,
+  title: "Questions",
+  metadata: { kind: "question" },
+  fields: questions.map((q, i) => ({
+    key: `q${i}`,
+    title: q.header,
+    description: q.question,
+    type: q.multiple ? "multiselect" : "string",
+    options: q.options.map((o: any) => ({ value: o.label, label: o.label, description: o.description })),
+    custom: true,
+  })),
+})
+
+test("v2 forms (guard off): question form forwarded; reply goes through the raising project's form API", async () => {
+  const v2 = await bootV2({ questionGuard: false }, { forms: true, more: ["/elsewhere"] })
+  expect(v2.calls.find((c) => c.method === "event.subscribe")!.args.types).toContain("form.created")
   wa.text("set it up")
   await until(() => v2.calls.some((c) => c.method === "session.prompt"))
   const sessionID = v2.calls.find((c) => c.method === "session.prompt")!.args.sessionID
-  const result = v2.question(sessionID, [DB_Q])
+  expect(v2.calls.find((c) => c.method === "session.create")!.args.permissions).toBeUndefined()
+  v2.emit("form.created", { form: formFrom("frm_1", sessionID, [DB_Q, FEATURES_Q]) }, { directory: "/elsewhere" })
   await until(() => wa.sent.length === 1)
-  expect(wa.sent[0].text).toContain("❓ *Database*")
-  wa.text("1")
-  const r: any = await result
-  expect(r.output).toEqual({ answers: [["Postgres"]] })
-  expect(r.content).toContain('"Which database should I use?"="Postgres"')
-  expect(v2.calls.some((c) => c.method === "question.original")).toBe(false)
+  expect(wa.sent[0].text).toContain("❓ *Database* (1/2)")
+  wa.text("2")
+  await until(() => wa.sent.length === 2)
+  wa.text("1,3")
+  await until(() => v2.calls.some((c) => c.method === "form.reply"))
+  const reply = v2.calls.find((c) => c.method === "form.reply")!.args
+  expect(reply.via).toBe("/elsewhere")
+  expect(reply.answer).toEqual({ q0: "SQLite", q1: [FEATURES_Q.options[0].label, FEATURES_Q.options[2].label] })
 })
 
-test("v2 question: other sessions use the TUI; /skip and interrupts fail the tool call", async () => {
-  const v2 = await bootV2()
-  const tui: any = await v2.question("ses_tui_only", [DB_Q])
-  expect(tui.content).toBe("tui")
-  expect(v2.calls.some((c) => c.method === "question.original")).toBe(true)
-  expect(wa.sent).toHaveLength(0)
-
+test("v2 forms (guard off): skips global and non-question forms; /skip cancels; replied in TUI clears it", async () => {
+  const v2 = await bootV2({ questionGuard: false }, { forms: true })
   wa.text("go")
   await until(() => v2.calls.some((c) => c.method === "session.prompt"))
   const sessionID = v2.calls.find((c) => c.method === "session.prompt")!.args.sessionID
-  const skipped = v2.question(sessionID, [DB_Q])
+  v2.emit("form.created", { form: { ...formFrom("frm_g", "global", [DB_Q]) } })
+  v2.emit("form.created", { form: { id: "frm_n", sessionID, title: "N", fields: [{ key: "n", type: "number" }] } })
+  v2.emit("form.created", { form: formFrom("frm_2", sessionID, [DB_Q]) })
   await until(() => wa.sent.length === 1)
+  expect(wa.sent[0].text).toContain("❓ *Database*")
   wa.text("/skip")
-  await expect(skipped).rejects.toThrow("dismissed")
-
-  const ac = new AbortController()
-  const interrupted = v2.question(sessionID, [DB_Q], ac.signal)
-  await until(() => wa.sent.length === 3) // ⏭️ Skipped. + the new question
-  ac.abort()
-  await expect(interrupted).rejects.toThrow("interrupted")
+  await until(() => v2.calls.some((c) => c.method === "form.cancel"))
+  expect(v2.calls.find((c) => c.method === "form.cancel")!.args).toEqual({ sessionID, formID: "frm_2", via: "/proj" })
+  await until(() => wa.sent.length === 2)
+  v2.emit("form.created", { form: formFrom("frm_3", sessionID, [DB_Q]) })
+  await until(() => wa.sent.length === 3)
+  v2.emit("form.replied", { id: "frm_3", sessionID, answer: { q0: "Postgres" } })
+  await Bun.sleep(30)
   wa.text("next message")
   await until(() => v2.calls.filter((c) => c.method === "session.prompt").length === 2) // not taken as an answer
+})
+
+test("v2 forms: dormant while the guard is on, even when ctx.session.form exists", async () => {
+  const v2 = await bootV2({}, { forms: true })
+  wa.text("go")
+  await until(() => v2.calls.some((c) => c.method === "session.prompt"))
+  const sessionID = v2.calls.find((c) => c.method === "session.prompt")!.args.sessionID
+  v2.emit("form.created", { form: formFrom("frm_x", sessionID, [DB_Q]) })
+  await Bun.sleep(60)
+  expect(wa.sent).toHaveLength(0)
 })
 
 test("no key: plugin is inert; non-https base URL is refused", async () => {
